@@ -133,6 +133,40 @@ const IntelligenceFeed = ({
     }
   });
 
+  // Piper voice picker. The dashboard lists every .onnx model present
+  // in the hub's piper_voices/ directory. Selection persists across
+  // reloads. When Piper isn't installed (or no models present) the
+  // /api/tts/voices endpoint returns available=false and the picker
+  // hides itself, leaving the browser TTS fallback path in charge.
+  const [piperVoices, setPiperVoices] = useState([]);
+  const [piperAvailable, setPiperAvailable] = useState(false);
+  const [selectedPiperVoice, setSelectedPiperVoice] = useState(() => {
+    try {
+      return window.localStorage.getItem('omnibot_piper_voice') || '';
+    } catch {
+      return '';
+    }
+  });
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/tts/voices')
+      .then((r) => r.ok ? r.json() : Promise.reject(r.status))
+      .then((data) => {
+        if (cancelled) return;
+        setPiperAvailable(!!data.available);
+        setPiperVoices(data.voices || []);
+        if (!selectedPiperVoice && data.default) {
+          setSelectedPiperVoice(data.default);
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn('[voice] /api/tts/voices failed:', err);
+        setPiperAvailable(false);
+      });
+    return () => { cancelled = true; };
+  }, [selectedPiperVoice]);
+
   useEffect(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return; // No SpeechRecognition in this browser — mic button hidden below.
@@ -221,6 +255,47 @@ const IntelligenceFeed = ({
   // before they're populated is silently dropped on some Chromium
   // builds. We also explicitly cancel any previous utterance to avoid
   // the queue piling up across rapid replies.
+  // Currently-playing piper audio element, kept in a ref so the next
+  // speak can stop+replace the previous one (matches the SpeechSynthesis
+  // cancel-and-speak pattern).
+  const piperAudioRef = useRef(null);
+
+  // Primary path: fetch synthesized audio from the hub's local Piper
+  // neural TTS endpoint. Falls back to browser SpeechSynthesis if the
+  // backend is unavailable or returns 503 (no piper voice installed).
+  const speak = async (text) => {
+    if (!text) return;
+    // Try Piper first, with the user's selected voice if any.
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voice: selectedPiperVoice || undefined }),
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        // Stop any in-flight piper playback so rapid replies don't overlap.
+        if (piperAudioRef.current) {
+          try { piperAudioRef.current.pause(); } catch {}
+          piperAudioRef.current.src = '';
+        }
+        const audio = new Audio(url);
+        piperAudioRef.current = audio;
+        audio.onplay = () => console.warn('[voice] piper playback started');
+        audio.onerror = (e) => console.warn('[voice] piper playback error', e);
+        audio.onended = () => URL.revokeObjectURL(url);
+        await audio.play();
+        return;
+      }
+      console.warn('[voice] piper unavailable (status', res.status + '), falling back to browser TTS');
+    } catch (err) {
+      console.warn('[voice] piper fetch failed, falling back to browser TTS:', err);
+    }
+    // Fallback: browser SpeechSynthesis with the previously-implemented logic.
+    speakWithBrowserTts(text);
+  };
+
   const speakWithBrowserTts = (text) => {
     if (!('speechSynthesis' in window)) {
       console.warn('[voice] speechSynthesis not available');
@@ -228,14 +303,18 @@ const IntelligenceFeed = ({
     }
     const synth = window.speechSynthesis;
     const doSpeak = () => {
-      const voices = synth.getVoices();
-      const preferred = voices.find((v) => v.lang?.startsWith('en')) || voices[0];
+      const all = synth.getVoices();
+      // User-selected voice wins; fall back to first en-* voice.
+      const chosen =
+        all.find((v) => v.name === selectedVoiceName) ||
+        all.find((v) => v.lang?.startsWith('en')) ||
+        all[0];
       const u = new SpeechSynthesisUtterance(text);
-      if (preferred) u.voice = preferred;
+      if (chosen) u.voice = chosen;
       u.rate = 1.05;
       u.pitch = 1.0;
       u.volume = 1.0;
-      u.onstart = () => console.warn('[voice] tts started, voice =', preferred?.name);
+      u.onstart = () => console.warn('[voice] tts started, voice =', chosen?.name);
       u.onerror = (ev) => console.warn('[voice] tts error', ev.error);
       synth.cancel(); // clear any in-flight queue
       synth.speak(u);
@@ -285,7 +364,7 @@ const IntelligenceFeed = ({
     if (lastAi) {
       const clean = String(lastAi.text).replace(/\[[0-9]+\]\([^)]*\)/g, '');
       console.warn('[voice] queueing tts for AI reply:', clean.slice(0, 60));
-      speakWithBrowserTts(clean);
+      speak(clean);
     } else {
       console.warn('[voice] turn finished but no ai entry with text found');
     }
@@ -470,6 +549,39 @@ const IntelligenceFeed = ({
             {isListening ? '● REC' : '🎤'}
           </button>
         )}
+        {piperAvailable && piperVoices.length > 0 && (
+          <select
+            value={selectedPiperVoice}
+            onChange={(e) => {
+              const name = e.target.value;
+              setSelectedPiperVoice(name);
+              try { window.localStorage.setItem('omnibot_piper_voice', name); } catch {}
+              // Preview the newly-chosen Piper voice immediately so the
+              // user hears it without having to send a chat first.
+              if (browserTtsEnabled) {
+                // speak() always sends the current selectedPiperVoice
+                // via the request body; we just kick a request.
+                speak('This is how I sound.');
+              }
+            }}
+            title="Piper neural voice"
+            style={{
+              maxWidth: 240,
+              marginRight: 6,
+              border: '1px solid currentColor',
+              borderRadius: 6,
+              padding: '4px 6px',
+              background: 'transparent',
+              cursor: 'pointer',
+            }}
+          >
+            {piperVoices.map((v) => (
+              <option key={v.name} value={v.name}>
+                {v.name} ({v.size_mb} MB)
+              </option>
+            ))}
+          </select>
+        )}
         {('speechSynthesis' in window) && (
           <button
             type="button"
@@ -481,11 +593,9 @@ const IntelligenceFeed = ({
                 window.localStorage.setItem('omnibot_browser_tts', next ? 'on' : 'off');
               } catch {}
               if (next) {
-                // Immediate audible confirmation that TTS is wired up.
-                // Useful for debugging "I can't hear anything" — if this
-                // doesn't make sound, the issue is OS-level (muted output,
-                // wrong audio device, etc.), not our code.
-                speakWithBrowserTts('Audio enabled.');
+                // Immediate audible confirmation that TTS is wired up
+                // (uses the same Piper-first path the chat replies do).
+                speak('Audio enabled.');
               } else {
                 window.speechSynthesis?.cancel();
               }

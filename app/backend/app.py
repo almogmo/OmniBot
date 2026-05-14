@@ -3326,6 +3326,134 @@ async def voice_bridge_websocket(websocket: WebSocket):
                     print(f"[live] voice bridge coordinator stop: {ex}")
 
 
+# ---------------------------------------------------------------------------
+# Piper neural TTS — local, free, no API key, near-human voice quality.
+# Activated by dropping a voice .onnx + .onnx.json pair into piper_voices/.
+# If the model isn't present the endpoint returns 503 and the dashboard
+# falls back to the browser's SpeechSynthesis API.
+# ---------------------------------------------------------------------------
+
+PIPER_DIR = Path(__file__).resolve().parent / "piper_voices"
+PIPER_BIN = Path(__file__).resolve().parent / ".venv" / "bin" / "piper"
+PIPER_DEFAULT_MODEL = "en_US-amy-medium"
+
+
+def _piper_voice_path(voice_name: Optional[str]) -> Optional[str]:
+    """Resolve a voice name (e.g. 'en_US-amy-medium') to its absolute
+    .onnx path inside PIPER_DIR. Returns None if the model isn't
+    installed. Empty/None voice_name resolves to the default voice."""
+    name = (voice_name or "").strip() or PIPER_DEFAULT_MODEL
+    # Guard against path traversal — only allow the basename.
+    name = os.path.basename(name)
+    if not name.endswith(".onnx"):
+        name = f"{name}.onnx"
+    p = PIPER_DIR / name
+    return str(p) if p.is_file() else None
+
+
+def _piper_list_installed() -> list[dict]:
+    """Scan PIPER_DIR for .onnx model files. Returns a list of
+    {name, path, size_mb} dicts sorted by name, suitable for the
+    dashboard voice picker."""
+    if not PIPER_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(PIPER_DIR.glob("*.onnx")):
+        # A valid voice has both .onnx and .onnx.json. Skip orphans so
+        # the dashboard never offers a voice that would crash piper.
+        cfg = p.with_suffix(".onnx.json")
+        if not cfg.is_file():
+            continue
+        out.append({
+            "name": p.stem,  # e.g. "en_US-amy-medium"
+            "size_mb": round(p.stat().st_size / (1024 * 1024), 1),
+        })
+    return out
+
+
+@app.get("/api/tts/voices")
+async def piper_list_voices():
+    """List Piper voices installed in piper_voices/. Empty list means
+    Piper isn't installed or no models are present — the dashboard then
+    hides its voice picker and falls back to browser TTS."""
+    if not PIPER_BIN.is_file():
+        return {"available": False, "default": PIPER_DEFAULT_MODEL, "voices": []}
+    return {
+        "available": True,
+        "default": PIPER_DEFAULT_MODEL,
+        "voices": _piper_list_installed(),
+    }
+
+
+class TtsRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None  # voice file basename, e.g. "en_US-ryan-medium"
+
+
+@app.post("/api/tts")
+async def piper_synthesize(req: TtsRequest):
+    """Generate WAV audio for `text` using local Piper neural TTS.
+
+    Returns the raw WAV bytes with `Content-Type: audio/wav`. The
+    frontend plays the response via a Blob URL on an HTMLAudioElement.
+    Capped at 4000 chars per request — anything longer takes too long
+    to feel responsive and is more likely an abuse signal than real
+    chat (typical replies are under 600 chars).
+    """
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text required")
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="text too long (max 4000)")
+
+    if not PIPER_BIN.is_file():
+        raise HTTPException(status_code=503,
+                            detail="piper not installed — see piper_voices/ README")
+    model_path = _piper_voice_path(req.voice)
+    if not model_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"voice '{req.voice or PIPER_DEFAULT_MODEL}' not installed",
+        )
+
+    import tempfile
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(PIPER_BIN),
+            "--model", model_path,
+            "--output-file", wav_path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await proc.communicate(input=text.encode("utf-8"))
+        if proc.returncode != 0:
+            print(f"[piper] synth failed: {stderr.decode('utf-8', errors='replace')[:300]}")
+            raise HTTPException(status_code=500, detail="piper failed")
+
+        with open(wav_path, "rb") as f:
+            wav = f.read()
+        if not wav:
+            raise HTTPException(status_code=500, detail="empty WAV")
+
+        from fastapi.responses import Response
+        return Response(
+            content=wav,
+            media_type="audio/wav",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Piper-Voice": os.path.basename(model_path).replace(".onnx", ""),
+            },
+        )
+    finally:
+        try:
+            os.remove(wav_path)
+        except Exception:
+            pass
+
+
 @app.post("/api/text-command")
 async def text_command(req: TextCommandRequest):
     """Receives a typed command from dashboard, streams AI reply, and forwards to ESP32."""
@@ -3377,6 +3505,17 @@ async def text_command(req: TextCommandRequest):
         text_chat_esp32_ws = get_active_esp32_socket(req.device_id)
         if text_chat_esp32_ws is not None:
             try:
+                # Echo the user's message onto the device's chat overlay
+                # immediately so the screen shows what was just asked
+                # even before the model starts replying. Then drive the
+                # display through THINKING.
+                user_visible = (message or "").strip()
+                if user_visible:
+                    await text_chat_esp32_ws.send_text(json.dumps({
+                        "type": "chat",
+                        "role": "user",
+                        "text": user_visible,
+                    }))
                 await text_chat_esp32_ws.send_text(json.dumps({"type": "wake_processing"}))
             except Exception:
                 pass
@@ -3416,6 +3555,14 @@ async def text_command(req: TextCommandRequest):
         # face_animation + assistant_speech_face just drive the display.
         if text_chat_esp32_ws is not None:
             try:
+                # Push the reply onto the chat overlay so the LCD shows
+                # the full conversation. Sent before the SPEAKING events
+                # so the user sees the text appear during playback.
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "chat",
+                    "role": "ai",
+                    "text": full_text,
+                }))
                 await text_chat_esp32_ws.send_text(json.dumps({
                     "type": "face_animation",
                     "animation": "happy_talk",
