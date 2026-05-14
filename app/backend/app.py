@@ -2725,7 +2725,15 @@ async def esp32_stream_endpoint(websocket: WebSocket):
     if stream_device_id != "default_bot":
         print(f"[stream] Inferred device_id={stream_device_id!r} (single Pixel + one named bot in settings)")
     live_coord = None
-    if USE_GEMINI_LIVE and get_gemini_api_key():
+    # Skip the Gemini Live setup entirely when the Ollama adapter is the
+    # active LLM backend — Ollama doesn't implement google.genai's async
+    # client (gc.aio.live.connect), so building a live coordinator just
+    # raises AttributeError and leaves the connect path with no
+    # runtime_* sync to send the device. Local-stack only — upstream
+    # OmniBot will always have a Gemini-shaped client.
+    from ollama_adapter import get_ollama_url
+    _ollama_active = bool(get_ollama_url())
+    if USE_GEMINI_LIVE and get_gemini_api_key() and not _ollama_active:
         live_coord = gemini_live_session.live_coordinator_for(stream_device_id)
         if live_coord is None:
             live_coord = _build_live_coordinator(stream_device_id)
@@ -2735,6 +2743,8 @@ async def esp32_stream_endpoint(websocket: WebSocket):
             await live_coord.ensure_started()
         except Exception as ex:
             print(f"[live] ensure_started on connect failed: {ex}")
+    elif _ollama_active:
+        print("[stream] Ollama backend active — skipping Gemini Live coordinator")
     record_bot_seen(stream_device_id)
     await manager.broadcast(
         {
