@@ -104,6 +104,86 @@ const IntelligenceFeed = ({
   const textInputRef = useRef(null);
   const [hubLogOpen, setHubLogOpen] = useState(false);
 
+  // Browser-side voice chat. Web Speech APIs are wired in two halves:
+  //   - SpeechRecognition (input): mic button toggles; on a final result we
+  //     populate the chat input and auto-submit, so the rest of the chat
+  //     flow (Ollama + Box-3 display animations) is identical to typing.
+  //   - SpeechSynthesis (output): new assistant messages are spoken via the
+  //     native TTS available on the host OS (macOS uses its built-in voices
+  //     — no cloud, no API key, no Gemini Live needed).
+  // Falls back gracefully when either API is unavailable in the browser.
+  const [isListening, setIsListening] = useState(false);
+  const recognitionRef = useRef(null);
+  const lastSpokenIdxRef = useRef(-1);
+  const sendOnFinalResultRef = useRef(false);
+  // Persist the user's mute preference across reloads. Defaults to ON
+  // (audible) so the voice loop "just works" out of the box.
+  const [browserTtsEnabled, setBrowserTtsEnabled] = useState(() => {
+    try {
+      return window.localStorage.getItem('omnibot_browser_tts') !== 'off';
+    } catch {
+      return true;
+    }
+  });
+
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return; // No SpeechRecognition in this browser — mic button hidden below.
+    const r = new SR();
+    r.continuous = false;
+    r.interimResults = true;
+    r.lang = 'en-US';
+    r.onresult = (e) => {
+      // Concatenate all chunks; show interim text live in the input box.
+      let txt = '';
+      let final = false;
+      for (let i = 0; i < e.results.length; i++) {
+        txt += e.results[i][0].transcript;
+        if (e.results[i].isFinal) final = true;
+      }
+      setTextMessage(txt.trim());
+      if (final) sendOnFinalResultRef.current = true;
+    };
+    r.onend = () => {
+      setIsListening(false);
+      if (sendOnFinalResultRef.current) {
+        sendOnFinalResultRef.current = false;
+        // Submit the form programmatically so the chat flow matches typed
+        // messages exactly (same /api/text-command POST, same Box-3 events).
+        setTimeout(() => {
+          const btn = document.querySelector('.text-command-send');
+          if (btn && !btn.disabled) btn.click();
+        }, 50);
+      }
+    };
+    r.onerror = (e) => {
+      console.warn('[voice] SpeechRecognition error', e.error);
+      setIsListening(false);
+    };
+    recognitionRef.current = r;
+  }, [setTextMessage]);
+
+  const voiceAvailable =
+    typeof window !== 'undefined' &&
+    (window.SpeechRecognition || window.webkitSpeechRecognition);
+
+  const toggleListening = () => {
+    const r = recognitionRef.current;
+    if (!r) return;
+    if (isListening) {
+      try { r.stop(); } catch {}
+      setIsListening(false);
+    } else {
+      setTextMessage('');
+      try {
+        r.start();
+        setIsListening(true);
+      } catch (err) {
+        console.warn('[voice] start failed', err);
+      }
+    }
+  };
+
   const chatLogs = useMemo(
     () =>
       logs.filter(
@@ -122,6 +202,36 @@ const IntelligenceFeed = ({
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatLogs]);
+
+  // Speak each new assistant reply once via the browser's native TTS.
+  // Tracks last-spoken length in a ref so re-renders don't replay old
+  // messages. On first mount we mark the current history as already-spoken
+  // so the whole log doesn't recite on page load. Falls back silently when
+  // SpeechSynthesis is unavailable.
+  useEffect(() => {
+    if (!('speechSynthesis' in window)) return;
+    if (lastSpokenIdxRef.current === -1) {
+      lastSpokenIdxRef.current = chatLogs.length - 1;
+      return;
+    }
+    // Bail (but still mark messages as seen) when the user has muted
+    // browser TTS — otherwise toggling unmute would replay backlog.
+    if (!browserTtsEnabled) {
+      lastSpokenIdxRef.current = chatLogs.length - 1;
+      return;
+    }
+    for (let i = lastSpokenIdxRef.current + 1; i < chatLogs.length; i++) {
+      const log = chatLogs[i];
+      if (log.sender === 'ai' && log.text) {
+        const clean = String(log.text).replace(/\[[0-9]+\]\([^)]*\)/g, '');
+        const u = new SpeechSynthesisUtterance(clean);
+        u.rate = 1.05;
+        u.pitch = 1.0;
+        window.speechSynthesis.speak(u);
+      }
+    }
+    lastSpokenIdxRef.current = chatLogs.length - 1;
+  }, [chatLogs.length, browserTtsEnabled]);
 
   useEffect(() => {
     if (!isSendingText) {
@@ -280,11 +390,60 @@ const IntelligenceFeed = ({
       </div>
 
       <form className="text-command-bar" onSubmit={onSendTextCommand}>
+        {voiceAvailable && (
+          <button
+            type="button"
+            className="text-command-mic"
+            onClick={toggleListening}
+            disabled={isSendingText}
+            title={isListening ? 'Stop listening' : 'Tap to speak'}
+            aria-label={isListening ? 'Stop listening' : 'Tap to speak'}
+            style={{
+              background: isListening ? '#e74c3c' : 'transparent',
+              color: isListening ? '#fff' : 'inherit',
+              border: '1px solid currentColor',
+              borderRadius: 6,
+              padding: '0 10px',
+              cursor: isSendingText ? 'not-allowed' : 'pointer',
+              marginRight: 6,
+            }}
+          >
+            {isListening ? '● REC' : '🎤'}
+          </button>
+        )}
+        {('speechSynthesis' in window) && (
+          <button
+            type="button"
+            className="text-command-tts-toggle"
+            onClick={() => {
+              const next = !browserTtsEnabled;
+              setBrowserTtsEnabled(next);
+              try {
+                window.localStorage.setItem('omnibot_browser_tts', next ? 'on' : 'off');
+              } catch {}
+              // If we just muted mid-utterance, stop the current one.
+              if (!next) window.speechSynthesis?.cancel();
+            }}
+            title={browserTtsEnabled ? 'Mute reply audio' : 'Unmute reply audio'}
+            aria-label={browserTtsEnabled ? 'Mute reply audio' : 'Unmute reply audio'}
+            style={{
+              background: 'transparent',
+              border: '1px solid currentColor',
+              borderRadius: 6,
+              padding: '0 10px',
+              cursor: 'pointer',
+              marginRight: 6,
+              opacity: browserTtsEnabled ? 1 : 0.5,
+            }}
+          >
+            {browserTtsEnabled ? '🔊' : '🔇'}
+          </button>
+        )}
         <input
           ref={textInputRef}
           type="text"
           className="text-command-input"
-          placeholder="Type a message to Pixel..."
+          placeholder={isListening ? 'Listening…' : 'Type a message to Pixel…'}
           value={textMessage}
           onChange={(e) => setTextMessage(e.target.value)}
         />

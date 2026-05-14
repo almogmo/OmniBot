@@ -2532,6 +2532,110 @@ def get_active_esp32_socket(device_id: str):
     return next(iter(active_streams), None)
 
 
+async def _speak_on_esp32(websocket, text: str) -> bool:
+    """Render `text` via macOS `say` and stream the PCM to the Box-3 speaker.
+
+    Uses the existing Vyko phone-as-brain audio protocol that command_parser
+    already implements (`audio_start` / `audio_chunk` / `audio_end` JSON
+    messages, base64-encoded PCM16 mono @ 16 kHz). omnibot.c routes WS text
+    frames into the same parser, so no firmware changes are needed.
+
+    Free, native, no API key. Chunks are paced to roughly match the device's
+    playback rate so the on-device 64 KB ring buffer stays bounded; the
+    parser drops overflow chunks silently if the producer runs too hot.
+
+    Returns True on success, False on any failure (caller stays silent).
+    """
+    if websocket is None or not text:
+        return False
+
+    import shutil, tempfile, struct as _struct
+    if not shutil.which("say"):
+        return False  # not on macOS — no-op
+
+    # Generate 16-bit little-endian PCM @ 16 kHz mono as a WAV file.
+    # `say --data-format=LEI16@16000` is the macOS-supported format string.
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav_path = tmp.name
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-o", wav_path, "--data-format=LEI16@16000", text,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await proc.wait()
+        if rc != 0:
+            return False
+
+        with open(wav_path, "rb") as f:
+            data = f.read()
+        os.remove(wav_path)
+    except Exception as e:
+        print(f"[say] generation failed: {e}")
+        return False
+
+    # WAV files from `say` include a JUNK padding chunk before `data`. Find
+    # the `data` chunk header dynamically rather than assuming a fixed 44 B
+    # header layout.
+    di = data.find(b"data")
+    if di < 0 or di + 8 > len(data):
+        return False
+    pcm_size = _struct.unpack_from("<I", data, di + 4)[0]
+    pcm = data[di + 8 : di + 8 + pcm_size]
+    if not pcm:
+        return False
+
+    # audio_start primes the device-side audio task. length is a hint;
+    # the task drains until it sees audio_end.
+    try:
+        await websocket.send_text(json.dumps({
+            "type": "audio_start",
+            "sampleRate": 16000,
+            "codec": "pcm16",
+            "length": len(pcm),
+        }))
+    except Exception:
+        return False
+
+    # Chunk size: command_parser caps writes at 256 B per JSON envelope.
+    # 128 B raw → ~172 B base64 → ~225 B envelope: comfortable fit.
+    CHUNK_BYTES = 128
+    # Pacing: real-time playback at 16 kHz/16-bit mono is 32000 B/s, so each
+    # 128 B chunk is 4 ms of audio. Send at slightly under that rate to keep
+    # the device's 64 KB ring buffer mostly empty (avoids overflow + drops).
+    PACING_SEC = 0.004
+
+    seq = 0
+    sent_bytes = 0
+    for i in range(0, len(pcm), CHUNK_BYTES):
+        chunk = pcm[i : i + CHUNK_BYTES]
+        b64 = base64.b64encode(chunk).decode("ascii")
+        is_last = (i + CHUNK_BYTES >= len(pcm))
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "audio_chunk",
+                "seq": seq,
+                "data": b64,
+                "last": is_last,
+            }))
+        except Exception as e:
+            print(f"[say] chunk {seq} send failed: {e}")
+            return False
+        seq += 1
+        sent_bytes += len(chunk)
+        # Yield + pace so the device task can drain.
+        await asyncio.sleep(PACING_SEC)
+
+    try:
+        await websocket.send_text(json.dumps({"type": "audio_end"}))
+    except Exception:
+        pass
+
+    # Estimate playback duration so the caller can hold the SPEAKING display
+    # state for roughly the right length of time.
+    return True
+
+
 def infer_stream_device_id_for_new_connection() -> str:
     """If only one Pixel is online, use the sole non-default_bot entry in settings (typical home setup)."""
     if len(active_streams) != 1:
@@ -3263,6 +3367,20 @@ async def text_command(req: TextCommandRequest):
 
     try:
         await _send_activity_event_to_esp32(req.device_id, "text_command")
+
+        # Drive the connected device's display during a text-chat turn so the
+        # Box-3 visibly reacts even though the user is typing in the browser.
+        # Sequence mirrors the Live-voice path: THINKING while the model
+        # generates → SPEAKING (with a face animation) while the reply lands
+        # → IDLE on completion. The handlers in firmware/main/command_parser
+        # translate these into FSM state transitions + display.set_mode().
+        text_chat_esp32_ws = get_active_esp32_socket(req.device_id)
+        if text_chat_esp32_ws is not None:
+            try:
+                await text_chat_esp32_ws.send_text(json.dumps({"type": "wake_processing"}))
+            except Exception:
+                pass
+
         live_coord = gemini_live_session.live_coordinator_for(req.device_id)
         if (
             USE_GEMINI_LIVE
@@ -3291,6 +3409,52 @@ async def text_command(req: TextCommandRequest):
             extra_system_suffix=BOOTSTRAP_MODE_SYSTEM_SUFFIX if req.bootstrap else "",
         )
         print(f"\n>>> GEMINI (TEXT) SAYS: {full_text}")
+
+        # Drive the device through SPEAKING → IDLE around the on-device TTS
+        # playback. The audio streaming itself uses Vyko's existing
+        # audio_start/chunk/end protocol (command_parser already handles it);
+        # face_animation + assistant_speech_face just drive the display.
+        if text_chat_esp32_ws is not None:
+            try:
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "face_animation",
+                    "animation": "happy_talk",
+                    "words": full_text[:120],
+                    "duration_ms": 4000,
+                }))
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "assistant_speech_face",
+                    "event": "start",
+                }))
+
+                # On-device speaker playback is blocked on the Box-3's
+                # ES8311 codec — same I2C bus that the ES7210 mic can't
+                # reach (see Phase 1 notes). The _speak_on_esp32 helper
+                # is kept in app.py so we can flip this back on by
+                # removing the False guard the moment the codec bus is
+                # verified. Until then we just animate the display and
+                # let the Mac speakers handle TTS via browser SpeechSynthesis.
+                _ENABLE_DEVICE_TTS = False
+                if _ENABLE_DEVICE_TTS:
+                    _spoke = await _speak_on_esp32(text_chat_esp32_ws, full_text)
+                    if _spoke:
+                        est_play_sec = max(2.0, min(15.0, len(full_text) * 0.08))
+                        await asyncio.sleep(est_play_sec)
+                    else:
+                        await asyncio.sleep(2.0)
+                else:
+                    # Hold SPEAKING long enough for the browser TTS to be
+                    # audibly synced with the display animation. Browser
+                    # speech rate ≈ 12 chars/s; cap at 12s for long replies.
+                    est = max(2.0, min(12.0, len(full_text) * 0.08))
+                    await asyncio.sleep(est)
+
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "assistant_speech_face",
+                    "event": "end",
+                }))
+            except Exception as e:
+                print(f"[text-command] device animation send failed: {e}")
 
         esp32_ws = get_active_esp32_socket(req.device_id)
         if esp32_ws:
