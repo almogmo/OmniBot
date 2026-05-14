@@ -715,9 +715,14 @@ def _ble_device_advertises_omnibot_service(device) -> bool:
 
 
 def _ble_device_is_pixel_setup(device) -> bool:
-    """Pixel in BLE provisioning: local name contains Pixel, or our service UUID appears in the advertisement."""
+    """Pixel in BLE provisioning: local name contains Pixel, or our service UUID appears in the advertisement.
+
+    Vyko-based Box-3 firmware advertises as VYKO_<xxxx> with the OmniBot service
+    UUID in the scan response. On macOS, Bleak's deprecated metadata API often
+    drops scan-response UUIDs, so the name prefix is the only reliable match.
+    """
     name = (device.name or "").strip()
-    if name and "Pixel" in name:
+    if name and ("Pixel" in name or name.startswith("VYKO_")):
         return True
     return _ble_device_advertises_omnibot_service(device)
 
