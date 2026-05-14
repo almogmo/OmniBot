@@ -116,6 +116,13 @@ const IntelligenceFeed = ({
   const recognitionRef = useRef(null);
   const lastSpokenIdxRef = useRef(-1);
   const sendOnFinalResultRef = useRef(false);
+
+  // Loud one-shot marker so we can verify the latest JS is loaded.
+  // If you don't see this on page load, the browser is serving a
+  // cached older bundle.
+  useEffect(() => {
+    console.warn('[voice] IntelligenceFeed mounted — voice rev 2026-05-14');
+  }, []);
   // Persist the user's mute preference across reloads. Defaults to ON
   // (audible) so the voice loop "just works" out of the box.
   const [browserTtsEnabled, setBrowserTtsEnabled] = useState(() => {
@@ -208,30 +215,82 @@ const IntelligenceFeed = ({
   // messages. On first mount we mark the current history as already-spoken
   // so the whole log doesn't recite on page load. Falls back silently when
   // SpeechSynthesis is unavailable.
+  // Helper: speak text with the system's native voice. Handles the
+  // common gotcha where window.speechSynthesis.getVoices() returns
+  // empty on first call — voices load asynchronously, and any speak()
+  // before they're populated is silently dropped on some Chromium
+  // builds. We also explicitly cancel any previous utterance to avoid
+  // the queue piling up across rapid replies.
+  const speakWithBrowserTts = (text) => {
+    if (!('speechSynthesis' in window)) {
+      console.warn('[voice] speechSynthesis not available');
+      return;
+    }
+    const synth = window.speechSynthesis;
+    const doSpeak = () => {
+      const voices = synth.getVoices();
+      const preferred = voices.find((v) => v.lang?.startsWith('en')) || voices[0];
+      const u = new SpeechSynthesisUtterance(text);
+      if (preferred) u.voice = preferred;
+      u.rate = 1.05;
+      u.pitch = 1.0;
+      u.volume = 1.0;
+      u.onstart = () => console.warn('[voice] tts started, voice =', preferred?.name);
+      u.onerror = (ev) => console.warn('[voice] tts error', ev.error);
+      synth.cancel(); // clear any in-flight queue
+      synth.speak(u);
+    };
+    if (synth.getVoices().length > 0) {
+      doSpeak();
+    } else {
+      // First-load case: wait for the voiceschanged event, then speak.
+      const handler = () => {
+        synth.removeEventListener('voiceschanged', handler);
+        doSpeak();
+      };
+      synth.addEventListener('voiceschanged', handler);
+      // Some Chromium versions never fire voiceschanged — fall back after 500 ms.
+      setTimeout(() => {
+        synth.removeEventListener('voiceschanged', handler);
+        doSpeak();
+      }, 500);
+    }
+  };
+
+  // Speak the LATEST AI reply when a chat turn completes. We detect
+  // completion via the isSendingText prop going true → false, which the
+  // parent already toggles around the /api/text-command request. Watching
+  // chatLogs.length doesn't work: replies stream in, so the entry exists
+  // with empty .text on the first update and length never re-increments
+  // as text fills in.
+  const wasSendingRef = useRef(false);
+  const lastSpokenLogsLenRef = useRef(0);
+
   useEffect(() => {
+    const justFinished = wasSendingRef.current && !isSendingText;
+    wasSendingRef.current = isSendingText;
+    if (!justFinished) return;
+    if (!browserTtsEnabled) return;
     if (!('speechSynthesis' in window)) return;
-    if (lastSpokenIdxRef.current === -1) {
-      lastSpokenIdxRef.current = chatLogs.length - 1;
-      return;
-    }
-    // Bail (but still mark messages as seen) when the user has muted
-    // browser TTS — otherwise toggling unmute would replay backlog.
-    if (!browserTtsEnabled) {
-      lastSpokenIdxRef.current = chatLogs.length - 1;
-      return;
-    }
-    for (let i = lastSpokenIdxRef.current + 1; i < chatLogs.length; i++) {
-      const log = chatLogs[i];
-      if (log.sender === 'ai' && log.text) {
-        const clean = String(log.text).replace(/\[[0-9]+\]\([^)]*\)/g, '');
-        const u = new SpeechSynthesisUtterance(clean);
-        u.rate = 1.05;
-        u.pitch = 1.0;
-        window.speechSynthesis.speak(u);
+    if (chatLogs.length <= lastSpokenLogsLenRef.current) return;
+
+    // Find the latest AI entry with non-empty text — the just-finished reply.
+    let lastAi = null;
+    for (let i = chatLogs.length - 1; i >= 0; i--) {
+      if (chatLogs[i].sender === 'ai' && chatLogs[i].text) {
+        lastAi = chatLogs[i];
+        break;
       }
     }
-    lastSpokenIdxRef.current = chatLogs.length - 1;
-  }, [chatLogs.length, browserTtsEnabled]);
+    if (lastAi) {
+      const clean = String(lastAi.text).replace(/\[[0-9]+\]\([^)]*\)/g, '');
+      console.warn('[voice] queueing tts for AI reply:', clean.slice(0, 60));
+      speakWithBrowserTts(clean);
+    } else {
+      console.warn('[voice] turn finished but no ai entry with text found');
+    }
+    lastSpokenLogsLenRef.current = chatLogs.length;
+  }, [isSendingText, chatLogs, browserTtsEnabled]);
 
   useEffect(() => {
     if (!isSendingText) {
@@ -421,8 +480,15 @@ const IntelligenceFeed = ({
               try {
                 window.localStorage.setItem('omnibot_browser_tts', next ? 'on' : 'off');
               } catch {}
-              // If we just muted mid-utterance, stop the current one.
-              if (!next) window.speechSynthesis?.cancel();
+              if (next) {
+                // Immediate audible confirmation that TTS is wired up.
+                // Useful for debugging "I can't hear anything" — if this
+                // doesn't make sound, the issue is OS-level (muted output,
+                // wrong audio device, etc.), not our code.
+                speakWithBrowserTts('Audio enabled.');
+              } else {
+                window.speechSynthesis?.cancel();
+              }
             }}
             title={browserTtsEnabled ? 'Mute reply audio' : 'Unmute reply audio'}
             aria-label={browserTtsEnabled ? 'Mute reply audio' : 'Unmute reply audio'}
