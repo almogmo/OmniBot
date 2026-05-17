@@ -260,40 +260,115 @@ const IntelligenceFeed = ({
   // cancel-and-speak pattern).
   const piperAudioRef = useRef(null);
 
-  // Primary path: fetch synthesized audio from the hub's local Piper
-  // neural TTS endpoint. Falls back to browser SpeechSynthesis if the
-  // backend is unavailable or returns 503 (no piper voice installed).
+  // Token of the currently-in-flight speak() invocation. A new call
+  // increments this; any older pipeline still running checks the ref
+  // against its captured token and bails on mismatch. Lets stopSpeaking
+  // and rapid back-to-back replies actually halt synth requests that
+  // haven't returned from Piper yet.
+  const speakTokenRef = useRef(0);
+
+  // Sentence-streamed Piper TTS. The model's reply can be a 200-token
+  // paragraph; synthesizing it as ONE Piper request means audio start
+  // has to wait for the full paragraph synth (~3–8s on Mac CPU). We
+  // split on sentence boundaries (. ! ? plus newlines), request each
+  // chunk in parallel, and play them strictly in order — first audio
+  // starts within ~1s of the first sentence finishing on Piper.
+  const splitSentences = (text) => {
+    // Split keeping the punctuation attached to its sentence.
+    // Falls back to one big chunk if no boundaries are found.
+    const out = [];
+    const re = /[^.!?\n]+[.!?\n]+|[^.!?\n]+$/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const s = m[0].trim();
+      if (s) out.push(s);
+    }
+    return out.length ? out : [text];
+  };
+
   const speak = async (text) => {
     if (!text) return;
-    // Try Piper first, with the user's selected voice if any.
-    try {
-      const res = await fetch('/api/tts', {
+    const myToken = ++speakTokenRef.current;
+
+    // Stop any in-flight piper playback so rapid replies don't overlap.
+    if (piperAudioRef.current) {
+      try { piperAudioRef.current.pause(); } catch {}
+      try { piperAudioRef.current.src = ''; } catch {}
+      piperAudioRef.current = null;
+    }
+
+    const sentences = splitSentences(text);
+
+    // Kick off all Piper requests in parallel — they'll come back in
+    // arbitrary order, but we await them in sequence below so playback
+    // stays correctly ordered. This pipelines synth + playback: while
+    // sentence N is playing, sentences N+1..end are still synthesizing.
+    const synthPromises = sentences.map((s) =>
+      fetch('/api/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voice: selectedPiperVoice || undefined }),
-      });
-      if (res.ok) {
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        // Stop any in-flight piper playback so rapid replies don't overlap.
-        if (piperAudioRef.current) {
-          try { piperAudioRef.current.pause(); } catch {}
-          piperAudioRef.current.src = '';
+        body: JSON.stringify({ text: s, voice: selectedPiperVoice || undefined }),
+      })
+        .then(async (res) => (res.ok ? URL.createObjectURL(await res.blob()) : null))
+        .catch(() => null)
+    );
+
+    try {
+      let piperFailed = false;
+      for (let i = 0; i < synthPromises.length; i++) {
+        // If a newer speak() superseded us, abandon the rest.
+        if (speakTokenRef.current !== myToken) return;
+        const url = await synthPromises[i];
+        if (speakTokenRef.current !== myToken) {
+          if (url) URL.revokeObjectURL(url);
+          return;
         }
+        if (!url) { piperFailed = true; continue; }
         const audio = new Audio(url);
         piperAudioRef.current = audio;
-        audio.onplay = () => console.warn('[voice] piper playback started');
+        if (i === 0) console.warn('[voice] piper playback started');
         audio.onerror = (e) => console.warn('[voice] piper playback error', e);
-        audio.onended = () => URL.revokeObjectURL(url);
-        await audio.play();
-        return;
+        // Wait for this clip to finish before starting the next.
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            try { URL.revokeObjectURL(url); } catch {}
+            resolve();
+          };
+          audio.onended = finish;
+          audio.onerror = finish;
+          audio.play().catch(finish);
+        });
       }
-      console.warn('[voice] piper unavailable (status', res.status + '), falling back to browser TTS');
+      if (piperFailed && speakTokenRef.current === myToken) {
+        // At least one chunk's synth failed entirely; for those we
+        // didn't play anything. Fall back to browser TTS for the
+        // remainder so the user still hears the reply.
+        console.warn('[voice] piper had failures; falling back to browser TTS for tail');
+        speakWithBrowserTts(text);
+      }
     } catch (err) {
-      console.warn('[voice] piper fetch failed, falling back to browser TTS:', err);
+      console.warn('[voice] piper pipeline failed, falling back to browser TTS:', err);
+      if (speakTokenRef.current === myToken) speakWithBrowserTts(text);
     }
-    // Fallback: browser SpeechSynthesis with the previously-implemented logic.
-    speakWithBrowserTts(text);
+  };
+
+  // Cut off whatever is currently being said. Hits both playback paths
+  // because we don't know which one is active at any given moment.
+  const stopSpeaking = () => {
+    // Bump the token so any pending sentence chunks in the streamed
+    // speak() pipeline drop their next .play() on the floor.
+    speakTokenRef.current += 1;
+    if (piperAudioRef.current) {
+      try { piperAudioRef.current.pause(); } catch {}
+      try { piperAudioRef.current.src = ''; } catch {}
+      piperAudioRef.current = null;
+    }
+    if ('speechSynthesis' in window) {
+      try { window.speechSynthesis.cancel(); } catch {}
+    }
   };
 
   const speakWithBrowserTts = (text) => {
@@ -362,7 +437,18 @@ const IntelligenceFeed = ({
       }
     }
     if (lastAi) {
-      const clean = String(lastAi.text).replace(/\[[0-9]+\]\([^)]*\)/g, '');
+      // Strip:
+      //  - markdown link footnotes  [1](url)
+      //  - asterisk-wrapped stage directions like *face_animation* or
+      //    *waves hand* — the model emits these as italics-style asides
+      //    and they read awkwardly when spoken aloud
+      //  - lingering backtick code spans `like_this`
+      const clean = String(lastAi.text)
+        .replace(/\[[0-9]+\]\([^)]*\)/g, '')
+        .replace(/\*[^*]+\*/g, '')
+        .replace(/`[^`]+`/g, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
       console.warn('[voice] queueing tts for AI reply:', clean.slice(0, 60));
       speak(clean);
     } else {
@@ -615,6 +701,23 @@ const IntelligenceFeed = ({
             {browserTtsEnabled ? '🔊' : '🔇'}
           </button>
         )}
+        <button
+          type="button"
+          className="text-command-tts-stop"
+          onClick={stopSpeaking}
+          title="Stop speaking"
+          aria-label="Stop speaking"
+          style={{
+            background: 'transparent',
+            border: '1px solid currentColor',
+            borderRadius: 6,
+            padding: '0 10px',
+            cursor: 'pointer',
+            marginRight: 6,
+          }}
+        >
+          ⏹
+        </button>
         <input
           ref={textInputRef}
           type="text"

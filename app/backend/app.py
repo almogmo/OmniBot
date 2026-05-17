@@ -3390,6 +3390,48 @@ class TtsRequest(BaseModel):
     voice: Optional[str] = None  # voice file basename, e.g. "en_US-ryan-medium"
 
 
+# --- Persistent Piper voice cache --------------------------------------------
+# The old code spawned a fresh `piper` subprocess per request, each one
+# loading the 60 MB .onnx model from scratch — that's ~1–3 s of overhead
+# on Mac CPU before any audio is synthesized. We instead load each voice
+# in-process via the piper-tts Python bindings and keep it pinned in a
+# dict for the life of the server. A per-voice asyncio.Lock serializes
+# concurrent requests onto the same voice (the underlying onnxruntime
+# session isn't thread-safe per call); different voices can synth in
+# parallel. Synth itself runs in a worker thread so it doesn't block
+# the event loop.
+
+_piper_voice_cache: dict[str, Any] = {}     # name -> PiperVoice
+_piper_voice_locks: dict[str, "asyncio.Lock"] = {}  # name -> Lock
+
+
+def _piper_get_voice(model_path: str):
+    """Return a loaded PiperVoice for the given .onnx path, loading on
+    first access and caching for subsequent calls. Each model is loaded
+    exactly once per server process — the 60 MB load cost is amortized
+    to zero over the chat session."""
+    cached = _piper_voice_cache.get(model_path)
+    if cached is not None:
+        return cached
+    from piper import PiperVoice  # local import keeps optional dep clean
+    print(f"[piper] loading voice (first request): {os.path.basename(model_path)}")
+    voice = PiperVoice.load(model_path)
+    _piper_voice_cache[model_path] = voice
+    return voice
+
+
+def _piper_synth_wav_bytes(model_path: str, text: str) -> bytes:
+    """Synthesize `text` to a WAV byte string using the cached voice.
+    Runs entirely in-process: no subprocess spawn, no model reload."""
+    import io
+    import wave
+    voice = _piper_get_voice(model_path)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        voice.synthesize_wav(text, wf)
+    return buf.getvalue()
+
+
 @app.post("/api/tts")
 async def piper_synthesize(req: TtsRequest):
     """Generate WAV audio for `text` using local Piper neural TTS.
@@ -3399,6 +3441,11 @@ async def piper_synthesize(req: TtsRequest):
     Capped at 4000 chars per request — anything longer takes too long
     to feel responsive and is more likely an abuse signal than real
     chat (typical replies are under 600 chars).
+
+    Performance: the voice .onnx is loaded once (lazily on first
+    request) and reused for every subsequent call. A short sentence
+    that previously took ~1.5 s (1 s model load + 0.5 s synth) now
+    takes only the synth time.
     """
     text = (req.text or "").strip()
     if not text:
@@ -3406,9 +3453,6 @@ async def piper_synthesize(req: TtsRequest):
     if len(text) > 4000:
         raise HTTPException(status_code=400, detail="text too long (max 4000)")
 
-    if not PIPER_BIN.is_file():
-        raise HTTPException(status_code=503,
-                            detail="piper not installed — see piper_voices/ README")
     model_path = _piper_voice_path(req.voice)
     if not model_path:
         raise HTTPException(
@@ -3416,42 +3460,35 @@ async def piper_synthesize(req: TtsRequest):
             detail=f"voice '{req.voice or PIPER_DEFAULT_MODEL}' not installed",
         )
 
-    import tempfile
-    fd, wav_path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
+    # Serialize concurrent requests for the SAME voice — onnxruntime's
+    # InferenceSession isn't safe for concurrent .run() calls. Different
+    # voices have separate locks and can synth in parallel.
+    lock = _piper_voice_locks.get(model_path)
+    if lock is None:
+        lock = asyncio.Lock()
+        _piper_voice_locks[model_path] = lock
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(PIPER_BIN),
-            "--model", model_path,
-            "--output-file", wav_path,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _stdout, stderr = await proc.communicate(input=text.encode("utf-8"))
-        if proc.returncode != 0:
-            print(f"[piper] synth failed: {stderr.decode('utf-8', errors='replace')[:300]}")
-            raise HTTPException(status_code=500, detail="piper failed")
+        async with lock:
+            # Synth is CPU-bound; push it to a worker thread so we don't
+            # stall the FastAPI event loop while it runs.
+            wav = await asyncio.to_thread(_piper_synth_wav_bytes, model_path, text)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[piper] synth failed: {exc!r}")
+        raise HTTPException(status_code=500, detail="piper failed") from exc
 
-        with open(wav_path, "rb") as f:
-            wav = f.read()
-        if not wav:
-            raise HTTPException(status_code=500, detail="empty WAV")
+    if not wav:
+        raise HTTPException(status_code=500, detail="empty WAV")
 
-        from fastapi.responses import Response
-        return Response(
-            content=wav,
-            media_type="audio/wav",
-            headers={
-                "Cache-Control": "no-store",
-                "X-Piper-Voice": os.path.basename(model_path).replace(".onnx", ""),
-            },
-        )
-    finally:
-        try:
-            os.remove(wav_path)
-        except Exception:
-            pass
+    from fastapi.responses import Response
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Piper-Voice": os.path.basename(model_path).replace(".onnx", ""),
+        },
+    )
 
 
 @app.post("/api/text-command")
@@ -3555,14 +3592,13 @@ async def text_command(req: TextCommandRequest):
         # face_animation + assistant_speech_face just drive the display.
         if text_chat_esp32_ws is not None:
             try:
-                # Push the reply onto the chat overlay so the LCD shows
-                # the full conversation. Sent before the SPEAKING events
-                # so the user sees the text appear during playback.
-                await text_chat_esp32_ws.send_text(json.dumps({
-                    "type": "chat",
-                    "role": "ai",
-                    "text": full_text,
-                }))
+                # Brief speech-face animation while audio plays. The
+                # chat[ai] send is deliberately deferred to AFTER
+                # assistant_speech_face:end below so the LCD lands in
+                # CHAT mode (showing the conversation) as the final
+                # state — wake_processing / face_animation /
+                # assistant_speech_face all switch the display mode
+                # and would otherwise overwrite the chat overlay.
                 await text_chat_esp32_ws.send_text(json.dumps({
                     "type": "face_animation",
                     "animation": "happy_talk",
@@ -3599,6 +3635,15 @@ async def text_command(req: TextCommandRequest):
                 await text_chat_esp32_ws.send_text(json.dumps({
                     "type": "assistant_speech_face",
                     "event": "end",
+                }))
+                # Finally, drop the full reply onto the chat overlay so
+                # the LCD lands in CHAT mode displaying You: ... + AI: ...
+                # as the resting state. Sent LAST so it isn't overwritten
+                # by the SPEAKING / IDLE mode switches above.
+                await text_chat_esp32_ws.send_text(json.dumps({
+                    "type": "chat",
+                    "role": "ai",
+                    "text": full_text,
                 }))
             except Exception as e:
                 print(f"[text-command] device animation send failed: {e}")
